@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import math
 import random
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
@@ -24,6 +25,14 @@ class SearchResult:
     best_trace: list[tuple[int, float]]
     iteration_stats: list[dict]
     update_stats: list[dict]
+    evaluation_count: int = 0
+    policy_update_time_s: float = 0.0
+    policy_decision_time_s: float = 0.0
+    best_info: dict | None = None
+    @property
+    def feasible(self) -> bool:
+        return self.best_info is not None and self.best_info["violations"] == 0
+
 
 
 def softmax(logits: np.ndarray) -> np.ndarray:
@@ -88,6 +97,19 @@ class LinearTRPOPolicy:
         self.W = 0.01 * self.rng.standard_normal((state_dim, action_dim))
         self.b = np.zeros(action_dim, dtype=float)
         self.value_w = np.zeros(state_dim, dtype=float)
+
+    def state_dict(self) -> dict:
+        return {"state_dim": self.state_dim, "action_dim": self.action_dim,
+                "W": self.W.tolist(), "b": self.b.tolist(), "value_w": self.value_w.tolist()}
+
+    def load_state_dict(self, state: dict) -> None:
+        if state["state_dim"] != self.state_dim or state["action_dim"] != self.action_dim:
+            raise ValueError("Policy dimensions do not match")
+        arrays = [np.asarray(state[k], dtype=float) for k in ("W", "b", "value_w")]
+        for arr, old in zip(arrays, (self.W, self.b, self.value_w)):
+            if arr.shape != old.shape or not np.all(np.isfinite(arr)):
+                raise ValueError("Invalid policy parameters")
+        self.W, self.b, self.value_w = [arr.copy() for arr in arrays]
 
     def probs(self, state: np.ndarray, theta: np.ndarray | None = None) -> np.ndarray:
         W, b = (self.W, self.b) if theta is None else unflatten_params(theta, self.state_dim, self.action_dim)
@@ -183,265 +205,7 @@ class LinearTRPOPolicy:
         return {"surrogate": float(best_surrogate), "kl": float(best_kl), "accepted": accepted}
 
 
-class MCEVRPRouteEvaluator:
-    def __init__(self, data):
-        self.data = data
-        self.depot = data["depot"]
-        self.customers = set(data["customers"])
-        self.stations = set(data["stations"])
-        self.vehicles = data["vehicles"]
-        self.products = data["products"]
-        self.alpha = data["alpha"]
-        self.beta = data["beta"]
-        self.travel_time = data["travel_time"]
-        self.route_cost = data["route_cost"]
-        self.demand = data["demand"]
-        self.vehicle_capacity = data["vehicle_capacity"]
-        self.compartment_capacity = data["compartment_capacity"]
-        self.battery_capacity = data["battery_capacity"]
-        self.safety_soc = data["safety_soc"]
-        self.charge_price = data["charge_price"]
-        self.charge_time_weight = data["charge_time_weight"]
-        self.tardiness_weight = data["tardiness_weight"]
-        self.fixed_cost = data["fixed_cost"]
-        self.service_time = data["service_time"]
-        self.time_window = data["time_window"]
-        self.rho = data["rho"]
-        self.gamma = data["gamma"]
-        self.breakpoint_names = sorted(data["breakpoints"])
-        self.penalty = 1e4
-
-    def charge_time_from_soc(self, station: Node, soc: float) -> float:
-        points = sorted((self.rho[b], self.gamma[(station, b)]) for b in self.breakpoint_names)
-        if soc <= points[0][0]:
-            return points[0][1]
-        if soc >= points[-1][0]:
-            return points[-1][1]
-        for (x0, y0), (x1, y1) in zip(points[:-1], points[1:]):
-            if x0 <= soc <= x1:
-                if abs(x1 - x0) < 1e-12:
-                    return y1
-                lam = (soc - x0) / (x1 - x0)
-                return y0 + lam * (y1 - y0)
-        return points[-1][1]
-
-    def initial_solution(self) -> dict[Vehicle, list[Node]]:
-        routes = {v: [] for v in self.vehicles}
-        remaining_cap = {v: self.vehicle_capacity[v] for v in self.vehicles}
-        sorted_customers = sorted(
-            self.customers,
-            key=lambda c: sum(self.demand[c][p] for p in self.products),
-            reverse=True,
-        )
-        for cust in sorted_customers:
-            demand_sum = sum(self.demand[cust][p] for p in self.products)
-            feasible_vehicles = [
-                v
-                for v in self.vehicles
-                if remaining_cap[v] >= demand_sum
-                and self._route_product_load(routes[v] + [cust], "A") <= self.compartment_capacity[(v, "L1")]
-                and self._route_product_load(routes[v] + [cust], "B") <= self.compartment_capacity[(v, "L2")]
-            ]
-            chosen = min(feasible_vehicles or self.vehicles, key=lambda v: remaining_cap[v], default=self.vehicles[0])
-            routes[chosen].append(cust)
-            remaining_cap[chosen] -= demand_sum
-        return routes
-
-    def _route_product_load(self, route: list[Node], product: str) -> float:
-        return sum(self.demand[node][product] for node in route if node in self.customers)
-
-    def _greedy_target_soc(self, vehicle: Vehicle, current_soc: float, suffix: Sequence[Node], remaining: dict[str, float]) -> float:
-        if len(suffix) <= 1:
-            return min(self.battery_capacity[vehicle], max(current_soc + 0.1, self.safety_soc[vehicle]))
-        needed_energy = 0.0
-        current = suffix[0]
-        shadow_remaining = remaining.copy()
-        for nxt in suffix[1:]:
-            if current == nxt or (current, nxt) not in self.alpha:
-                break
-            arc_load = shadow_remaining["A"] + shadow_remaining["B"]
-            needed_energy += self.alpha[(current, nxt)] + self.beta[(current, nxt)] * arc_load
-            if nxt in self.customers:
-                shadow_remaining["A"] -= self.demand[nxt]["A"]
-                shadow_remaining["B"] -= self.demand[nxt]["B"]
-            if nxt in self.stations:
-                break
-            current = nxt
-        target = max(current_soc + 0.1, needed_energy + self.safety_soc[vehicle])
-        return min(self.battery_capacity[vehicle], target)
-
-    def evaluate(self, solution: dict[Vehicle, list[Node]]) -> tuple[float, dict]:
-        total_cost = 0.0
-        violations = 0
-        tardiness_total = 0.0
-        battery_violations = 0
-        used_vehicles = 0
-        visited_customers = []
-        route_details = {}
-
-        for vehicle, route in solution.items():
-            if route:
-                explicit_route = [self.depot] + route + [self.depot]
-                used_vehicles += 1
-                total_cost += self.fixed_cost[vehicle]
-            else:
-                route_details[vehicle] = {"detail": [], "charge_stops": 0}
-                continue
-
-            station_visits = [n for n in route if n in self.stations]
-            repeated_station_visits = len(station_visits) - len(set(station_visits))
-            if repeated_station_visits > 0:
-                violations += repeated_station_visits
-                total_cost += self.penalty * repeated_station_visits
-
-            prod_a = self._route_product_load(route, "A")
-            prod_b = self._route_product_load(route, "B")
-            total_load = prod_a + prod_b
-
-            if total_load > self.vehicle_capacity[vehicle] + 1e-9:
-                violations += 1
-                total_cost += self.penalty * (total_load - self.vehicle_capacity[vehicle])
-            if prod_a > self.compartment_capacity[(vehicle, "L1")] + 1e-9:
-                violations += 1
-                total_cost += self.penalty * (prod_a - self.compartment_capacity[(vehicle, "L1")])
-            if prod_b > self.compartment_capacity[(vehicle, "L2")] + 1e-9:
-                violations += 1
-                total_cost += self.penalty * (prod_b - self.compartment_capacity[(vehicle, "L2")])
-
-            remaining = {"A": prod_a, "B": prod_b}
-            soc = self.battery_capacity[vehicle]
-            time = 0.0
-            charge_stops = 0
-            detail = []
-
-            for idx in range(len(explicit_route) - 1):
-                i, j = explicit_route[idx], explicit_route[idx + 1]
-                if i == j or (i, j) not in self.alpha:
-                    violations += 1
-                    total_cost += self.penalty
-                    continue
-                arc_load = remaining["A"] + remaining["B"]
-                travel_energy = self.alpha[(i, j)] + self.beta[(i, j)] * arc_load
-                soc_after = soc - travel_energy
-                total_cost += self.route_cost[(i, j)]
-                time += self.travel_time[(i, j)]
-
-                if soc_after < self.safety_soc[vehicle] - 1e-9:
-                    battery_violations += 1
-                    violations += 1
-                    total_cost += self.penalty * (self.safety_soc[vehicle] - soc_after)
-                soc = soc_after
-
-                step_info = {
-                    "from": i,
-                    "to": j,
-                    "time": time,
-                    "soc": soc,
-                    "load_a": remaining["A"],
-                    "load_b": remaining["B"],
-                }
-
-                if j in self.customers:
-                    visited_customers.append(j)
-                    open_t, close_t = self.time_window[j]
-                    if time < open_t:
-                        time = open_t
-                    tard = max(0.0, time - close_t)
-                    tardiness_total += tard
-                    total_cost += self.tardiness_weight * tard
-                    time += self.service_time[j]
-                    remaining["A"] -= self.demand[j]["A"]
-                    remaining["B"] -= self.demand[j]["B"]
-                    step_info["tardiness"] = tard
-
-                elif j in self.stations:
-                    charge_stops += 1
-                    target_soc = self._greedy_target_soc(vehicle, soc, explicit_route[idx + 1 :], remaining)
-                    if target_soc > soc + 1e-9:
-                        charge_amount = target_soc - soc
-                        charge_duration = self.charge_time_from_soc(j, target_soc) - self.charge_time_from_soc(j, soc)
-                        soc = target_soc
-                        time += charge_duration
-                        total_cost += self.charge_price[j] * charge_amount
-                        total_cost += self.charge_time_weight * charge_duration
-                        step_info["charge_amount"] = charge_amount
-                        step_info["charge_time"] = charge_duration
-                    else:
-                        violations += 1
-                        total_cost += self.penalty * 0.1
-
-                detail.append(step_info)
-            route_details[vehicle] = {"detail": detail, "charge_stops": charge_stops}
-
-        missing = len(self.customers - set(visited_customers))
-        duplicates = max(0, len(visited_customers) - len(set(visited_customers)))
-        if missing or duplicates:
-            violations += missing + duplicates
-            total_cost += self.penalty * (missing + duplicates)
-
-        info = {
-            "violations": violations,
-            "battery_violations": battery_violations,
-            "tardiness_total": tardiness_total,
-            "used_vehicles": used_vehicles,
-            "route_details": route_details,
-        }
-        return total_cost, info
-
-    def verify_model_requirements(self, solution: dict[Vehicle, list[Node]]) -> dict:
-        cost, info = self.evaluate(solution)
-        route_customer_counts = {c: 0 for c in self.customers}
-        station_repeat_violations = 0
-        unknown_node_violations = 0
-        vehicle_capacity_violations = 0
-        compartment_capacity_violations = 0
-
-        for vehicle, route in solution.items():
-            seen_stations = set()
-            prod_a = self._route_product_load(route, "A")
-            prod_b = self._route_product_load(route, "B")
-            total_load = prod_a + prod_b
-            if total_load > self.vehicle_capacity[vehicle] + 1e-9:
-                vehicle_capacity_violations += 1
-            if prod_a > self.compartment_capacity[(vehicle, "L1")] + 1e-9:
-                compartment_capacity_violations += 1
-            if prod_b > self.compartment_capacity[(vehicle, "L2")] + 1e-9:
-                compartment_capacity_violations += 1
-            for node in route:
-                if node in self.customers:
-                    route_customer_counts[node] += 1
-                elif node in self.stations:
-                    if node in seen_stations:
-                        station_repeat_violations += 1
-                    seen_stations.add(node)
-                else:
-                    unknown_node_violations += 1
-
-        missing_customers = sum(1 for c, cnt in route_customer_counts.items() if cnt == 0)
-        duplicate_customers = sum(max(0, cnt - 1) for cnt in route_customer_counts.values())
-        feasible = (
-            info["violations"] == 0
-            and missing_customers == 0
-            and duplicate_customers == 0
-            and station_repeat_violations == 0
-            and unknown_node_violations == 0
-            and vehicle_capacity_violations == 0
-            and compartment_capacity_violations == 0
-        )
-        return {
-            "feasible": feasible,
-            "cost": cost,
-            "violations": info["violations"],
-            "battery_violations": info["battery_violations"],
-            "tardiness_total": info["tardiness_total"],
-            "used_vehicles": info["used_vehicles"],
-            "missing_customers": missing_customers,
-            "duplicate_customers": duplicate_customers,
-            "station_repeat_violations": station_repeat_violations,
-            "unknown_node_violations": unknown_node_violations,
-            "vehicle_capacity_violations": vehicle_capacity_violations,
-            "compartment_capacity_violations": compartment_capacity_violations,
-        }
+from generalized_evaluator import MCEVRPRouteEvaluator
 
 
 class TabuTRPOSearch:
@@ -459,6 +223,8 @@ class TabuTRPOSearch:
         trpo_top_actions: int = 3,
         intensify_every: int = 10,
         stagnation_limit: int = 20,
+        feasible_only: bool = False,
+        policy_state: dict | None = None,
     ):
         self.data = data
         self.rng = random.Random(seed)
@@ -473,10 +239,13 @@ class TabuTRPOSearch:
             max_kl=trpo_max_kl,
             seed=seed,
         )
+        if policy_state is not None:
+            self.policy.load_state_dict(policy_state)
         self.policy_mode = policy_mode
         self.trpo_top_actions = max(1, min(trpo_top_actions, len(self.ACTION_NAMES)))
         self.intensify_every = max(1, intensify_every)
         self.stagnation_limit = max(2, stagnation_limit)
+        self.feasible_only = feasible_only
         self.customer_list = list(data["customers"])
         self.station_list = list(data["stations"])
         self.vehicles = data["vehicles"]
@@ -605,13 +374,12 @@ class TabuTRPOSearch:
                         cand[v].pop(idx)
                         candidates.append((cand, {"vehicle": v, "station": station, "index": idx}))
                 if station not in route:
-                    customer_positions = [idx for idx, n in enumerate(route) if n in self.evaluator.customers]
-                    for idx in customer_positions:
-                        if idx + 1 < len(route) and route[idx + 1] == station:
-                            continue
+                    if not route:
+                        continue
+                    for idx in range(len(route) + 1):
                         cand = self._copy_solution(solution)
-                        cand[v].insert(idx + 1, station)
-                        candidates.append((cand, {"vehicle": v, "station": station, "index": idx + 1}))
+                        cand[v].insert(idx, station)
+                        candidates.append((cand, {"vehicle": v, "station": station, "index": idx}))
         return candidates
 
     def generate_candidates(self, solution, action: int):
@@ -625,7 +393,7 @@ class TabuTRPOSearch:
         return generators[action](solution)
 
     def choose_action_set(self, state: np.ndarray, iteration: int, stagnation: int) -> tuple[list[int], np.ndarray]:
-        if self.policy_mode == "trpo":
+        if self.policy_mode in {"trpo", "frozen_trpo"}:
             probs = self.policy.probs(state)
             ranked = list(np.argsort(-probs))
             shortlisted = ranked[: self.trpo_top_actions]
@@ -649,16 +417,25 @@ class TabuTRPOSearch:
         return (
             cand_info["violations"],
             cand_info["battery_violations"],
-            round(cand_info["tardiness_total"], 8),
             cand_cost,
             cand_info["used_vehicles"],
         )
 
-    def run(self, iterations: int = 120) -> SearchResult:
-        current = self.evaluator.initial_solution()
+    def run(
+        self,
+        iterations: int = 120,
+        max_evaluations: int | None = None,
+        initial_solution: dict[Vehicle, list[Node]] | None = None,
+        deadline: float | None = None,
+    ) -> SearchResult:
+        current = self._copy_solution(initial_solution) if initial_solution is not None else self.evaluator.initial_solution()
+        for vehicle in self.vehicles:
+            current.setdefault(vehicle, [])
         current_cost, current_info = self.evaluator.evaluate(current)
+        evaluation_count = 1
         best = self._copy_solution(current)
         best_cost = current_cost
+        best_info = current_info
         best_trace = [(0, best_cost)]
         stagnation = 0
 
@@ -669,40 +446,81 @@ class TabuTRPOSearch:
         experience_probs = []
         iteration_stats = []
         update_stats = []
+        policy_update_time_s = 0.0
+        policy_decision_time_s = 0.0
+
+        def update_policy(states_np, actions_np, rewards_np, probs_np):
+            nonlocal policy_update_time_s
+            if self.policy_mode != "trpo":
+                return
+            update_started = time.perf_counter()
+            stats = self.policy.update(states_np, actions_np, rewards_np, probs_np)
+            stats["update_time_s"] = time.perf_counter() - update_started
+            policy_update_time_s += stats["update_time_s"]
+            update_stats.append(stats)
 
         for iteration in range(1, iterations + 1):
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
             state = self.state_features(current_cost, current_info, best_cost, iteration, iterations)
+            decision_started = time.perf_counter()
             action_set, probs = self.choose_action_set(state, iteration, stagnation)
+            policy_decision_time_s += time.perf_counter() - decision_started
 
             evaluated = []
             seen_candidates = set()
+            budget_exhausted = False
             for alt_action in action_set:
                 for cand, meta in self.generate_candidates(current, alt_action):
+                    if deadline is not None and time.perf_counter() >= deadline:
+                        budget_exhausted = True
+                        break
+                    if max_evaluations is not None and evaluation_count >= max_evaluations:
+                        budget_exhausted = True
+                        break
                     sig = self.move_signature(alt_action, meta)
                     sol_sig = self._solution_signature(cand)
                     if sol_sig in seen_candidates:
                         continue
                     seen_candidates.add(sol_sig)
                     cand_cost, cand_info = self.evaluator.evaluate(cand)
-                    aspiration = cand_cost < best_cost
+                    evaluation_count += 1
+                    if self.feasible_only and cand_info["violations"] > 0:
+                        continue
+                    aspiration = (cand_info["violations"] == 0 and best_info["violations"] > 0) or (cand_info["violations"] == best_info["violations"] and cand_cost < best_cost)
                     if sig in tabu and not aspiration:
                         continue
                     evaluated.append((cand_cost, cand_info, cand, sig, alt_action))
+                if budget_exhausted:
+                    break
 
             if not evaluated:
+                if budget_exhausted or (max_evaluations is not None and evaluation_count >= max_evaluations):
+                    break
                 evaluated = []
                 for alt_action in range(len(self.ACTION_NAMES)):
                     for cand, meta in self.generate_candidates(current, alt_action):
+                        if deadline is not None and time.perf_counter() >= deadline:
+                            budget_exhausted = True
+                            break
+                        if max_evaluations is not None and evaluation_count >= max_evaluations:
+                            budget_exhausted = True
+                            break
                         sig = self.move_signature(alt_action, meta)
                         sol_sig = self._solution_signature(cand)
                         if sol_sig in seen_candidates:
                             continue
                         seen_candidates.add(sol_sig)
                         cand_cost, cand_info = self.evaluator.evaluate(cand)
-                        aspiration = cand_cost < best_cost
+                        evaluation_count += 1
+                        if self.feasible_only and cand_info["violations"] > 0:
+                            continue
+                        aspiration = (cand_info["violations"] == 0 and best_info["violations"] > 0) or (cand_info["violations"] == best_info["violations"] and cand_cost < best_cost)
                         if sig in tabu and not aspiration:
                             continue
                         evaluated.append((cand_cost, cand_info, cand, sig, alt_action))
+                    if budget_exhausted:
+                        break
                     if evaluated:
                         break
                 if not evaluated:
@@ -728,17 +546,21 @@ class TabuTRPOSearch:
             current_info = cand_info
             tabu.append(sig)
 
-            if current_cost < best_cost:
+            if (current_info["violations"] == 0 and best_info["violations"] > 0) or (
+                (current_info["violations"] == 0) == (best_info["violations"] == 0)
+                and self._candidate_rank(current_cost, current_info) < self._candidate_rank(best_cost, best_info)
+            ):
                 best = self._copy_solution(current)
                 best_cost = current_cost
+                best_info = current_info
                 best_trace.append((iteration, best_cost))
                 stagnation = 0
             else:
                 stagnation += 1
 
-            if stagnation >= self.stagnation_limit and self.policy_mode == "trpo":
+            if stagnation >= self.stagnation_limit and self.policy_mode in {"trpo", "frozen_trpo"}:
                 current = self._copy_solution(best)
-                current_cost, current_info = self.evaluator.evaluate(current)
+                current_cost, current_info = best_cost, best_info
                 tabu.clear()
                 stagnation = 0
 
@@ -762,25 +584,36 @@ class TabuTRPOSearch:
                 actions_np = np.asarray(experience_actions, dtype=int)
                 rewards_np = np.asarray(experience_rewards, dtype=float)
                 probs_np = np.vstack(experience_probs)
-                if self.policy_mode == "trpo":
-                    update_stats.append(self.policy.update(states_np, actions_np, rewards_np, probs_np))
+                update_policy(states_np, actions_np, rewards_np, probs_np)
                 experience_states.clear()
                 experience_actions.clear()
                 experience_rewards.clear()
                 experience_probs.clear()
+            if max_evaluations is not None and evaluation_count >= max_evaluations:
+                break
 
-        if experience_states:
+        if experience_states and (deadline is None or time.perf_counter() < deadline):
             states_np = np.vstack(experience_states)
             actions_np = np.asarray(experience_actions, dtype=int)
             rewards_np = np.asarray(experience_rewards, dtype=float)
             probs_np = np.vstack(experience_probs)
-            if self.policy_mode == "trpo":
-                update_stats.append(self.policy.update(states_np, actions_np, rewards_np, probs_np))
+            update_policy(states_np, actions_np, rewards_np, probs_np)
 
-        return SearchResult(best, best_cost, best_trace, iteration_stats, update_stats)
+        return SearchResult(
+            best,
+            best_cost,
+            best_trace,
+            iteration_stats,
+            update_stats,
+            evaluation_count,
+            policy_update_time_s,
+            policy_decision_time_s,
+            best_info,
+        )
 
 
 def pretty_print_result(result: SearchResult) -> None:
+    print(f"Feasible: {result.feasible}")
     print(f"Best cost: {result.best_cost:.3f}")
     print("Best routes:")
     for vehicle, route in result.best_solution.items():
